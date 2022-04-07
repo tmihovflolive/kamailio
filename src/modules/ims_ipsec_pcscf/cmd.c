@@ -50,7 +50,6 @@
 
 #include "ipsec.h"
 #include "spi_gen.h"
-#include "port_gen.h"
 #include "cmd.h"
 #include "sec_agree.h"
 
@@ -352,7 +351,18 @@ static int update_contact_ipsec_params(ipsec_t* s, const struct sip_msg* m, ipse
     s->ik.len = ik.len;
 
     // Generate SPI
-    if((s->spi_pc = acquire_spi()) == 0) {
+    if(s_old) {
+        if(s_old->spi_pc && s_old->spi_ps && s_old->port_pc && s_old->port_ps) {
+            LM_ERR("Error using old IPSEC tunnel creation\n");
+            s->spi_pc = s_old->spi_pc;
+            s->spi_ps = s_old->spi_ps;
+            s->port_pc = s_old->port_pc;
+            s->port_ps = s_old->port_ps;
+            return 0;
+        }
+    }
+
+    if(acquire_spi(&s->spi_pc, &s->spi_ps, &s->port_pc, &s->port_ps) == 0) {
         LM_ERR("Error generating client SPI for IPSEC tunnel creation\n");
         shm_free(s->ck.s);
         s->ck.s = NULL; s->ck.len = 0;
@@ -360,48 +370,6 @@ static int update_contact_ipsec_params(ipsec_t* s, const struct sip_msg* m, ipse
         s->ik.s = NULL; s->ik.len = 0;
         return -1;
     }
-
-    if((s->spi_ps = acquire_spi()) == 0) {
-        LM_ERR("Error generating server SPI for IPSEC tunnel creation\n");
-        shm_free(s->ck.s);
-        s->ck.s = NULL; s->ck.len = 0;
-        shm_free(s->ik.s);
-        s->ik.s = NULL; s->ik.len = 0;
-
-		release_spi(s->spi_pc);
-        return -1;
-    }
-
-    if((s->port_pc = acquire_cport()) == 0){
-        LM_ERR("No free client port for IPSEC tunnel creation\n");
-		shm_free(s->ck.s);
-		s->ck.s = NULL; s->ck.len = 0;
-		shm_free(s->ik.s);
-		s->ik.s = NULL; s->ik.len = 0;
-
-		release_spi(s->spi_pc);
-		release_spi(s->spi_ps);
-        return -1;
-    }
-
-	// use the same P-CSCF server port if it is present
-	if(s_old){
-		s->port_ps = s_old->port_ps;
-	}else{
-		if((s->port_ps = acquire_sport()) == 0){
-			LM_ERR("No free server port for IPSEC tunnel creation\n");
-			shm_free(s->ck.s);
-			s->ck.s = NULL; s->ck.len = 0;
-			shm_free(s->ik.s);
-			s->ik.s = NULL; s->ik.len = 0;
-
-			release_cport(s->port_pc);
-
-			release_spi(s->spi_pc);
-			release_spi(s->spi_ps);
-			return -1;
-		}
-	}
 
 	return 0;
 }
@@ -509,12 +477,7 @@ static int destroy_ipsec_tunnel(str remote_addr, ipsec_t* s, unsigned short rece
     remove_policy(sock, remote_addr, ipsec_addr, s->port_us, s->port_pc, s->spi_pc, ip_addr.af, IPSEC_POLICY_DIRECTION_IN);
 
     // Release SPIs
-    release_spi(s->spi_pc);
-    release_spi(s->spi_ps);
-
-    // Release the client and the server ports
-    release_cport(s->port_pc);
-    release_sport(s->port_ps);
+    release_spi(s->spi_pc, s->spi_ps, s->port_pc, s->port_ps);
 
     close_mnl_socket(sock);
     return 0;
@@ -742,11 +705,16 @@ int ipsec_create(struct sip_msg* m, udomain_t* d, int _cflags)
         }
 
 		// for Re-Registration use the same P-CSCF server port if 'ipsec reuse server port' is enabled
-        if(update_contact_ipsec_params(req_sec_params->data.ipsec, m, ipsec_reuse_server_port ? pcontact->security_temp->data.ipsec : NULL) != 0) {
+        if(update_contact_ipsec_params(req_sec_params->data.ipsec, m, (ipsec_reuse_server_port && pcontact->security_temp) ? pcontact->security_temp->data.ipsec : NULL) != 0) {
             goto cleanup;
         }
 
         if(create_ipsec_tunnel(&req->rcv.src_ip, req_sec_params->data.ipsec) != 0){
+            goto cleanup;
+        }
+
+        if (ul.update_pcontact(d, &ci, pcontact) != 0) {
+            LM_ERR("Error updating contact\n");
             goto cleanup;
         }
 
@@ -986,11 +954,6 @@ int ipsec_reconfig()
 	if(ul.get_number_of_contacts() != 0){
 		return 0;
 	}
-
-	clean_spi_list();
-	clean_port_lists();
-
-	LM_DBG("Clean all ipsec tunnels\n");
 
 	return ipsec_cleanall();
 }
